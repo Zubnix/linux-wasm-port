@@ -6,10 +6,13 @@
 #include <linux/sched/task_stack.h>
 #include <linux/sched/task.h>
 
+_Thread_local struct task_struct *current = &init_task;
+
 // TODO(wasm): replace __builtin_wasm_memory_atomic with completion?
 
-struct task_struct *__switch_to(struct task_struct *from,
-				struct task_struct *to)
+// noinline for debugging purposes
+struct task_struct *noinline __switch_to(struct task_struct *from,
+					 struct task_struct *to)
 {
 	struct thread_info *from_info = task_thread_info(from);
 	struct thread_info *to_info = task_thread_info(to);
@@ -19,21 +22,16 @@ struct task_struct *__switch_to(struct task_struct *from,
 	BUG_ON(cpu < 0); // current process must be scheduled to a cpu
 
 	// give the current cpu to the new worker
-	other_cpu = atomic_xchg(&to_info->running_cpu, cpu);
-	BUG_ON(other_cpu >= 0); // new process should not have had a cpu
+	other_cpu = atomic_cmpxchg(&to_info->running_cpu, -1, cpu);
+	BUG_ON(other_cpu != -1); // new process should not have had a cpu
 
 	// wake the other worker:
-	pr_info("wake cpu=%i task=%p\n", cpu, to);
-	// memory.atomic.notify returns how many waiters were notified
-	// 0 is fine, because it means the worker isn't running yet
-	// 1 is great, because it means someone is waiting for this number
-	// 2+ means there's an issue, because I asked for only 1
+	// pr_info("wake cpu=%i task=%p\n", cpu, to);
 	BUG_ON(__builtin_wasm_memory_atomic_notify(
 		       &to_info->running_cpu.counter,
-		       /* how many to wake up (at most): */ 1) > 1);
+		       /* at most, wake up: */ 1) > 1);
 
-	pr_info("waiting cpu=%i task=%p in switch\n",
-		atomic_read(&from_info->running_cpu), from);
+	// pr_info("waiting cpu=%i task=%p in switch\n", cpu, from);
 
 	// sleep this worker:
 	/* memory.atomic.wait32 returns:
@@ -48,11 +46,11 @@ struct task_struct *__switch_to(struct task_struct *from,
 					    /* block if the value is: */ -1,
 					    /* timeout: */ -1);
 
-	pr_info("woke up cpu=%i task=%p in switch\n", cpu, from);
+	// pr_info("woke up cpu=%i task=%p in switch\n", cpu, from);
 
 	BUG_ON(cpu < 0); // we should be given a new cpu
 
-	return from;
+	return current;
 }
 
 int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
@@ -69,7 +67,7 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 	childregs->fn = args->fn;
 	childregs->fn_arg = args->fn_arg;
 
-	pr_info("spawning task=%p\n", p);
+	pr_info("spawning task=%p %s %d\n", p, p->comm, *(int *)p->sched_class);
 	wasm_new_worker(p, p->comm, strnlen(p->comm, TASK_COMM_LEN));
 
 	return 0;
@@ -78,6 +76,7 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 static void noinline_for_stack start_task_inner(struct task_struct *task)
 {
 	struct thread_info *info = task_thread_info(task);
+	struct task_struct *prev;
 	struct pt_regs *regs = task_pt_regs(task);
 	int cpu;
 
@@ -91,15 +90,22 @@ static void noinline_for_stack start_task_inner(struct task_struct *task)
 
 	cpu = atomic_read(&info->running_cpu);
 
-	early_printk("                       woke up cpu=%i task=%p in entry\n",
-		     cpu, task);
+	early_printk(
+		"                       woke up cpu=%i task=%p kcpu=%i in entry\n",
+		cpu, task, info->cpu);
 
 	smp_tls_init(cpu, false);
-
-	schedule_tail(current);
-
+	// As a thread local variable, all uses of current should be below tls init:
+	prev = current;
 	current = task;
 
+	if (prev) {
+		pr_info("schedule_tail(%p %d %s)\n", prev, prev->pid,
+			prev->comm);
+		schedule_tail(prev);
+	}
+
+	pr_info("fn %p(%p)\n", regs->fn, regs->fn_arg);
 	// callback returns only if the kernel thread execs a process
 	regs->fn(regs->fn_arg);
 
