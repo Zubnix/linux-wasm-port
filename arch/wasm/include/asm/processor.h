@@ -2,13 +2,16 @@
 #define _WASM_PROCESSOR_H
 
 #include <asm/bug.h>
+#include <asm/current.h>
+#include <asm/globals.h>
+#include <asm/thread_info.h>
 #include <asm/wasm_imports.h>
 
 struct task_struct;
 
 void cpu_relax(void);
 
-#define current_text_addr() wasm_return_address(-1)
+#define current_text_addr() wasm_kernel_return_address(-1)
 
 static inline unsigned long thread_saved_pc(struct task_struct *tsk)
 {
@@ -48,5 +51,8 @@ struct thread_struct {};
 
 #define KSTK_EIP(tsk) (0)
 #define KSTK_ESP(tsk) (0)
+
+#define on_thread_stack() \
+	((unsigned long)(current->stack - get_stack_pointer()) < THREAD_SIZE)
 
 #endif

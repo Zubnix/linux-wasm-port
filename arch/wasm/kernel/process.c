@@ -2,20 +2,30 @@
 #include <asm/globals.h>
 #include <asm/sysmem.h>
 #include <asm/wasm_imports.h>
+#include <linux/entry-common.h>
 #include <linux/sched.h>
 #include <linux/sched/task_stack.h>
 #include <linux/sched/task.h>
 
-_Thread_local struct task_struct *current = &init_task;
+struct task_bootstrap_args {
+	struct task_struct *task;
+	int (*fn)(void *);
+	void *fn_arg;
+};
 
-// TODO(wasm): replace __builtin_wasm_memory_atomic with completion?
+int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
+{
+	*dst = *src;
+	atomic_set(&task_thread_info(dst)->running_cpu, -1);
+	return 0;
+}
 
-// noinline for debugging purposes
-struct task_struct *noinline __switch_to(struct task_struct *from,
-					 struct task_struct *to)
+struct task_struct *__switch_to(struct task_struct *from,
+				struct task_struct *to)
 {
 	struct thread_info *from_info = task_thread_info(from);
 	struct thread_info *to_info = task_thread_info(to);
+	struct task_struct *prev;
 	int cpu, other_cpu;
 
 	cpu = atomic_xchg(&from_info->running_cpu, -1);
@@ -45,76 +55,103 @@ struct task_struct *noinline __switch_to(struct task_struct *from,
 	__builtin_wasm_memory_atomic_wait32(&from_info->running_cpu.counter,
 					    /* block if the value is: */ -1,
 					    /* timeout: */ -1);
+	cpu = atomic_read(&from_info->running_cpu);
+	BUG_ON(cpu < 0); // we should be given a new cpu
+	set_current_cpu(cpu);
+	prev = get_current_task_on(cpu);
+	set_current_task(current);
 
 	// pr_info("woke up cpu=%i task=%p in switch\n", cpu, from);
 
-	BUG_ON(cpu < 0); // we should be given a new cpu
-
-	return current;
+	return prev;
 }
 
 int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 {
 	struct pt_regs *childregs = task_pt_regs(p);
+	struct task_bootstrap_args *bootstrap_args;
+	char name[TASK_COMM_LEN + 16] = { 0 };
+	int name_len;
 
 	memset(childregs, 0, sizeof(struct pt_regs));
 
 	atomic_set(&task_thread_info(p)->running_cpu, -1);
 
+	// don't spawn a worker for idle threads
+	// this is probably a bad idea
+	if (args->idle) return 0;
+
 	if (!args->fn)
 		panic("can't copy userspace thread"); // yet
 
-	childregs->fn = args->fn;
-	childregs->fn_arg = args->fn_arg;
+	bootstrap_args =
+		kzalloc(sizeof(struct task_bootstrap_args), GFP_KERNEL);
+	if (!bootstrap_args)
+		panic("can't allocate bootstrap args");
 
-	pr_info("spawning task=%p %s %d\n", p, p->comm, *(int *)p->sched_class);
-	wasm_new_worker(p, p->comm, strnlen(p->comm, TASK_COMM_LEN));
+	bootstrap_args->task = p;
+	bootstrap_args->fn = args->fn;
+	bootstrap_args->fn_arg = args->fn_arg;
+
+	name_len = snprintf(name, ARRAY_SIZE(name), "%s (%d)", p->comm, p->pid);
+
+	wasm_kernel_new_worker(bootstrap_args, name, name_len);
 
 	return 0;
 }
 
-static void noinline_for_stack start_task_inner(struct task_struct *task)
+static void noinline_for_stack start_task_inner(struct task_bootstrap_args *args)
 {
+	struct task_struct *task = args->task;
+	int (*fn)(void *) = args->fn;
+	int fn_ret;
+	void *fn_arg = args->fn_arg;
 	struct thread_info *info = task_thread_info(task);
 	struct task_struct *prev;
-	struct pt_regs *regs = task_pt_regs(task);
-	int cpu;
 
-	early_printk("                       waiting cpu=%i task=%p in entry\n",
-		     atomic_read(&info->running_cpu), task);
+	// early_printk("                       waiting cpu=%i task=%p in entry\n",
+	// 	     atomic_read(&info->running_cpu), task);
 
 	// if we don't currently have a cpu, wait for one
-	__builtin_wasm_memory_atomic_wait32(&info->running_cpu.counter,
-					    /* block if the value is: */ -1,
-					    /* timeout: */ -1);
-
-	cpu = atomic_read(&info->running_cpu);
-
-	early_printk(
-		"                       woke up cpu=%i task=%p kcpu=%i in entry\n",
-		cpu, task, info->cpu);
-
-	smp_tls_init(cpu, false);
-	// As a thread local variable, all uses of current should be below tls init:
-	prev = current;
-	current = task;
-
-	if (prev) {
-		pr_info("schedule_tail(%p %d %s)\n", prev, prev->pid,
-			prev->comm);
-		schedule_tail(prev);
+	for (;;) {
+		int ret = __builtin_wasm_memory_atomic_wait32(
+			&info->running_cpu.counter,
+			/* block if the value is: */ -1,
+			/* timeout: 1s */ 1000 * 1000 * 1000);
+		if (ret != 2) // 2 means timeout
+			break;
+		early_printk("task %p %s %d is waiting for cpu in entry\n",
+			     task, task->comm, task->pid);
 	}
 
-	pr_info("fn %p(%p)\n", regs->fn, regs->fn_arg);
+	set_current_cpu(atomic_read(&info->running_cpu));
+	BUG_ON(raw_smp_processor_id() < 0);
+
+	prev = get_current_task_on(raw_smp_processor_id());
+	set_current_task(task);
+
+	kfree(args);
+
+	// early_printk(
+	// 	"                       woke up cpu=%i task=%p prev=%p kcpu=%i in entry\n",
+	// 	raw_smp_processor_id(), task, prev, info->cpu);
+
+	schedule_tail(prev);
+
 	// callback returns only if the kernel thread execs a process
-	regs->fn(regs->fn_arg);
+	fn_ret = fn(fn_arg);
 
 	// call into userspace?
-	panic("can't call userspace\n");
+	pr_info("task finished on cpu %d\n", raw_smp_processor_id());
+
+	do_exit(0);
+
+	// syscall_exit_to_user_mode(&(struct pt_regs){ 0 });
 }
 
-__attribute__((export_name("task"))) void _start_task(struct task_struct *task)
+__attribute__((export_name("task"))) void
+_start_task(struct task_bootstrap_args *args)
 {
-	set_stack_pointer(task_pt_regs(task) - 1);
-	start_task_inner(task);
+	set_stack_pointer(task_pt_regs(args->task) - 1);
+	start_task_inner(args);
 }

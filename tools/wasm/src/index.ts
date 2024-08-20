@@ -1,132 +1,156 @@
-import { generateDevicetree } from "./devicetree.ts";
-import type { FromWorkerMessage, ToWorkerMessage } from "./worker.ts";
-import { unreachable } from "./util.ts";
+import sections from "./build/sections.json" with { type: "json" };
+import vmlinuxUrl from "./build/vmlinux.wasm";
+import { type DeviceTreeNode, generateDevicetree } from "./devicetree.ts";
+import { sendBootstrap, transfer } from "./rpc.ts";
+import { assert, EventEmitter, getScriptPath, type u32 } from "./util.ts";
+import * as virtio from "./virtio.ts";
+import { Entropy } from "./worker/virtio.ts";
+import type { MainExposed, WorkerExposed } from "./worker/worker.ts";
 
-const PAGE_SIZE = 1 << 16; // 64KiB
+const vmlinux = WebAssembly.compileStreaming(
+  fetch(new URL(vmlinuxUrl, import.meta.url)),
+);
 
-interface MachineEventMap {
-  restart: CustomEvent<void>;
-  error: CustomEvent<{ error: Error; threadName: string }>;
-}
+export class Machine extends EventEmitter<{
+  halt: void;
+  restart: void;
+  error: { error: Error; threadName: string };
+}> {
+  #bootConsole: TransformStream<Uint8Array, Uint8Array>;
+  #bootConsoleWriter: WritableStreamDefaultWriter<Uint8Array>;
+  #workers: Worker[] = [];
+  #memory: WebAssembly.Memory;
+  #Worker: typeof globalThis.Worker;
 
-interface Machine {
-  bootConsole: ReadableStream<Uint8Array>;
+  memory: Uint8Array;
+  devicetree: DeviceTreeNode;
 
-  addEventListener<K extends keyof MachineEventMap>(
-    type: K,
-    listener: (this: AbortSignal, ev: MachineEventMap[K]) => void,
-    options?: boolean | AddEventListenerOptions,
-  ): void;
-  removeEventListener<K extends keyof MachineEventMap>(
-    type: K,
-    listener: (this: AbortSignal, ev: MachineEventMap[K]) => void,
-    options?: boolean | EventListenerOptions,
-  ): void;
-}
-
-export function start({
-  cmdline,
-  vmlinux,
-  memoryPages = 1024, // 64MiB
-}: {
-  cmdline: string;
-  vmlinux: WebAssembly.Module;
-  memoryPages?: number;
-}) {
-  const bootConsole = new TransformStream<Uint8Array, Uint8Array>();
-  const bootConsoleWriter = bootConsole.writable.getWriter();
-
-  const eventTarget = new EventTarget();
-  function emit<K extends keyof MachineEventMap>(
-    type: K,
-    detail: MachineEventMap[K]["detail"],
-  ) {
-    eventTarget.dispatchEvent(new CustomEvent(type, { detail }));
+  get bootConsole() {
+    return this.#bootConsole.readable;
   }
 
-  function newWorker(
-    name: string,
-    initMessage: ToWorkerMessage,
-    initTransfer: Transferable[],
-  ) {
-    const worker = new Worker(
-      new URL(
-        (() => {
-          import("./worker.ts");
-        }).toString().match(/import\("(.*)"\)/)![1],
-        import.meta.url,
-      ),
-      { type: "module", name },
-    );
+  constructor(options: {
+    cmdline?: string;
+    memoryMib?: number;
+    cpus?: number;
+    Worker?: typeof globalThis.Worker;
+  }) {
+    super();
+    this.#bootConsole = new TransformStream<Uint8Array, Uint8Array>();
+    this.#bootConsoleWriter = this.#bootConsole.writable.getWriter();
+    this.#Worker = options.Worker ?? globalThis.Worker;
 
-    worker.onmessage = async ({ data }: MessageEvent<FromWorkerMessage>) => {
-      switch (data.type) {
-        case "boot-console-write":
-          bootConsoleWriter.write(data.message);
-          break;
-        case "boot-console-close":
-          await bootConsoleWriter.close();
-          await bootConsole.writable.close();
-          break;
-        case "restart":
-          emit("restart", undefined);
-          break;
-        case "spawn":
-          newWorker(data.name, {
-            type: "task",
-            task: data.task,
-            vmlinux,
-            memory,
-          }, []);
-          break;
-        case "error":
-          emit("error", { error: data.error, threadName: name });
-          break;
-        case "bringup-secondary":
-          newWorker(`entry${data.cpu}`, {
-            type: "secondary",
-            cpu: data.cpu,
-            idle: data.idle,
-            vmlinux,
-            memory,
-          }, []);
-          break;
-        default:
-          unreachable(
-            data,
-            `invalid worker message type: ${(data as { type: string }).type}`,
-          );
-      }
+    const PAGE_SIZE = 0x10000;
+    const BYTES_PER_MIB = 0x100000;
+    const bytes = (options.memoryMib ?? 128) * BYTES_PER_MIB;
+    const pages = bytes / PAGE_SIZE;
+    this.#memory = new WebAssembly.Memory({
+      initial: pages,
+      maximum: pages,
+      shared: true,
+    });
+    assert(this.#memory.buffer.byteLength === bytes);
+    this.memory = new Uint8Array(this.#memory.buffer);
+
+    // this is a slightly arbitrary choice, but as long as this is
+    // less than the number of pages the module requests, there will be
+    // no overlap
+    let mmioBase = PAGE_SIZE * 32;
+    const mmioAlloc = (size: number) => {
+      const ptr = mmioBase;
+      mmioBase += size;
+      return [ptr, size] as const;
     };
 
-    worker.postMessage(initMessage, initTransfer);
+    const RNG_REG = mmioAlloc(0x100);
+    const rng = new virtio.Registers(
+      this.memory.subarray(RNG_REG[0], RNG_REG[0] + RNG_REG[1]),
+    );
+
+    rng.magic = 0x74726976 as u32; // "virt" in ascii
+    rng.version = 2 as u32;
+    rng.deviceId = Entropy.DEVICE_ID;
+    rng.vendorId = 0x7761736d as u32; // "wasm" in ascii
+    rng.driverFeatures = virtio.F_VERSION_1;
+
+    this.devicetree = {
+      "#address-cells": 1,
+      "#size-cells": 1,
+      chosen: {
+        "rng-seed": crypto.getRandomValues(new Uint8Array(64)),
+        bootargs: options.cmdline ?? "no_hash_pointers",
+        ncpus: options.cpus ?? navigator.hardwareConcurrency,
+        sections,
+      },
+      aliases: {},
+      memory: {
+        device_type: "memory",
+        reg: [0, bytes],
+      },
+      "reserved-memory": {
+        "#address-cells": 1,
+        "#size-cells": 1,
+        ranges: undefined,
+        rng: {
+          reg: RNG_REG,
+        },
+      },
+      // disk: {
+      //   compatible: "virtio,wasm",
+      //   "host-id": 0x7777,
+      //   "virtio-id": 2, // blk
+      //   interrupts: 31,
+      // },
+      // rng: {
+      //   compatible: "virtio,wasm",
+      //   "host-id": 0x4321,
+      //   "virtio-id": Entropy.DEVICE_ID,
+      //   interrupts: 32,
+      // },
+      rng: {
+        compatible: "virtio,mmio",
+        reg: RNG_REG,
+        interrupts: [42],
+      },
+    };
   }
 
-  const memory = new WebAssembly.Memory({
-    initial: memoryPages,
-    maximum: memoryPages,
-    shared: true,
-  });
+  async boot() {
+    const devicetree = generateDevicetree(this.devicetree);
+    const worker = await this.#spawn("entry");
+    await worker.boot(await vmlinux, this.#memory, transfer(devicetree.buffer));
+  }
 
-  const devicetree = generateDevicetree({
-    chosen: {
-      "rng-seed": crypto.getRandomValues(new Uint8Array(64)),
-      bootargs: cmdline,
-    },
-    aliases: {},
-    memory: {
-      device_type: "memory",
-      reg: [0, memoryPages * PAGE_SIZE],
-    },
-  });
-
-  newWorker(
-    "entry",
-    { type: "boot", devicetree, vmlinux, memory },
-    [devicetree.buffer],
-  );
-
-  const machine = eventTarget as unknown as Machine;
-  machine.bootConsole = bootConsole.readable;
-  return machine;
+  #spawn(name: string) {
+    const worker = new this.#Worker(
+      getScriptPath(() => import("./worker/worker.ts"), import.meta),
+      { type: "module", name },
+    );
+    this.#workers.push(worker);
+    return sendBootstrap<MainExposed, WorkerExposed>(worker, {
+      bootConsoleWrite: async (message) => {
+        await this.#bootConsoleWriter.write(new Uint8Array(message));
+      },
+      bootConsoleClose: async () => {
+        await Promise.all([
+          this.#bootConsoleWriter.close(),
+          this.#bootConsole.writable.close(),
+        ]);
+      },
+      restart: () => {
+        this.emit("restart", undefined);
+      },
+      spawnTask: async (task, name) => {
+        const worker = await this.#spawn(name);
+        await worker.task(await vmlinux, this.#memory, task);
+      },
+      error: (error) => {
+        this.emit("error", { error, threadName: name });
+      },
+      bringupSecondary: async (cpu, idle) => {
+        const worker = await this.#spawn(`entry${cpu}`);
+        await worker.secondary(await vmlinux, this.#memory, cpu, idle);
+      },
+    });
+  }
 }

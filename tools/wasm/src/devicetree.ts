@@ -1,4 +1,4 @@
-import { assert, unreachable } from "./util.ts";
+import { assert, type u32, type u64, unreachable } from "./util.ts";
 
 const FDT_MAGIC = 0xd00dfeed;
 const FDT_BEGIN_NODE = 0x00000001;
@@ -8,28 +8,20 @@ const FDT_END = 0x00000009;
 const NODE_NAME_MAX_LEN = 31;
 const PROPERTY_NAME_MAX_LEN = 31;
 
-function byteswap32(n: number) {
-  return (
-    ((n & 0xff) << 24) |
-    ((n & 0xff00) << 8) |
-    ((n >> 8) & 0xff00) |
-    ((n >> 24) & 0xff)
-  );
-}
-
-interface DeviceTreeNode {
+export interface DeviceTreeNode {
   [key: string]: DeviceTreeNode | DeviceTreeProperty;
 }
 type DeviceTreeProperty =
   | string
   | number
   | bigint
-  | number[]
+  | readonly number[]
   | Uint8Array
   | Uint16Array
   | Uint32Array
   | BigUint64Array
-  | ArrayBuffer;
+  | ArrayBuffer
+  | undefined;
 
 function inner(
   tree: DeviceTreeNode,
@@ -114,18 +106,18 @@ function inner(
       let value: ArrayBuffer;
       switch (typeof prop) {
         case "number":
-          value = new Uint32Array([byteswap32(prop)]).buffer;
+          value = new Uint32Array(1).buffer;
+          new DataView(value).setUint32(0, prop);
           break;
         case "bigint":
-          value = new BigUint64Array([prop]).buffer;
+          value = new BigUint64Array(1).buffer;
+          new DataView(value).setBigUint64(0, prop);
           break;
         case "string":
           value = new TextEncoder().encode(`${prop}\0`).buffer;
           break;
         case "object":
-          if (Array.isArray(prop)) {
-            value = new Uint32Array(prop.map(byteswap32)).buffer;
-          } else if (
+          if (
             prop instanceof Uint8Array ||
             prop instanceof Uint16Array ||
             prop instanceof Uint32Array ||
@@ -135,10 +127,11 @@ function inner(
           } else if (prop instanceof ArrayBuffer) {
             value = prop;
           } else {
-            unreachable(
-              prop,
-              `unsupported prop type: ${(prop as object)?.constructor.name}`,
-            );
+            value = new Uint32Array(prop.length).buffer;
+            const dv = new DataView(value);
+            for (const [i, n] of prop.entries()) {
+              dv.setUint32(i * 4, n);
+            }
           }
           break;
         case "undefined":
@@ -206,12 +199,12 @@ function inner(
 
 export function generateDevicetree(tree: DeviceTreeNode, {
   memoryReservations = [],
-  bootCpuId = 0,
+  bootCpuId = 0 as u32,
 }: {
   memoryReservations?: Array<
-    { address: number | bigint; size: number | bigint }
+    { address: u64; size: u64 }
   >;
-  bootCpuId?: number;
+  bootCpuId?: u32;
 } = {}) {
   return inner(tree, memoryReservations, bootCpuId, 1024);
 }

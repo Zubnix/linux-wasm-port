@@ -19,11 +19,6 @@ void __delay(unsigned long cycles)
 	BUG_ON(ret != 2); // 2 means timeout
 }
 
-void cpu_relax(void)
-{
-	__delay(100);
-}
-
 void __udelay(unsigned long usecs)
 {
 	__delay(usecs * 1000);
@@ -39,8 +34,8 @@ void __const_udelay(unsigned long xloops)
 
 unsigned long long sched_clock(void) {
 	static u64 origin = 0;
-	if (!origin) origin = wasm_get_now_nsec();
-	return wasm_get_now_nsec() - origin;
+	if (!origin) origin = wasm_kernel_get_now_nsec();
+	return wasm_kernel_get_now_nsec() - origin;
 }
 
 static u64 clock_read(struct clocksource *cs)
@@ -58,6 +53,6 @@ static struct clocksource clocksource = {
 
 void __init time_init(void)
 {
-	if (clocksource_register_khz(&clocksource, 1000000))
+	if (clocksource_register_khz(&clocksource, 1000 * 1000))
 		panic("unable to register clocksource\n");
 }

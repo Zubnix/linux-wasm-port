@@ -6,37 +6,41 @@
     <title>Linux</title>
     <script
       crossorigin="anonymous"
-      src="https://unpkg.com/@xterm/xterm@5.4.0/lib/xterm.js"
+      src="https://unpkg.com/@xterm/xterm@5.5.0/lib/xterm.js"
     ></script>
     <script
       crossorigin="anonymous"
-      src="https://unpkg.com/@xterm/addon-fit@0.9.0/lib/addon-fit.js"
+      src="https://unpkg.com/@xterm/addon-fit@0.10.0/lib/addon-fit.js"
     ></script>
     <script
       crossorigin="anonymous"
-      src="https://unpkg.com/@xterm/addon-webgl@0.17.0/lib/addon-webgl.js"
+      src="https://unpkg.com/@xterm/addon-webgl@0.18.0/lib/addon-webgl.js"
     ></script>
     <link
       crossorigin="anonymous"
       rel="stylesheet"
-      href="https://unpkg.com/xterm@5.3.0/css/xterm.css"
+      href="https://unpkg.com/@xterm/xterm@5.5.0/css/xterm.css"
     />
     <style>
       :root {
         color-scheme: light dark;
       }
-      body {
-        margin: 0;
-      }
-      .terminal {
-        height: 100dvh;
+      html {
+        height: 100%;
+        body {
+          margin: 0;
+          height: 100%;
+          .terminal {
+            height: 100%;
+          }
+        }
       }
       details {
         font-family: monospace;
         position: absolute;
         top: 0;
         right: 0;
-        z-index: 1;
+        z-index: 10;
         background-color: gray;
         form {
           display: flex;
@@ -55,13 +59,13 @@
     <details>
       <summary>options</summary>
       <form>
-        <label>path: <input type="text" name="path" /></label>
         <label>cmdline: <input type="text" name="cmdline" /></label>
+        <label>memory (MiB): <input type="number" name="memory" /></label>
         <button>reboot</button>
       </form>
     </details>
     <script type="module">
-      import { start } from "./dist/index.js";
+      import { Machine } from "./dist/index.js";
 
       const term = new Terminal({ convertEol: true, disableStdin: true });
       const termFit = new FitAddon.FitAddon();
@@ -79,14 +83,15 @@
         term.write("Error: not cross origin isolated\n");
       }
 
-      const { path = "vmlinux.wasm", cmdline = "no_hash_pointers" } =
-        Object.fromEntries(new URLSearchParams(location.search));
-      document.querySelector("input[name=path]").value = path;
+      const { cmdline = "no_hash_pointers", memory = 128 } = Object.fromEntries(
+        new URLSearchParams(location.search)
+      );
       document.querySelector("input[name=cmdline]").value = cmdline;
+      document.querySelector("input[name=memory]").value = memory;
 
-      const machine = start({
+      const machine = new Machine({
         cmdline: cmdline.replace(/\+/g, " "),
-        vmlinux: await WebAssembly.compileStreaming(fetch(path)),
+        memoryMib: memory,
       });
 
       machine.bootConsole.pipeTo(
@@ -98,13 +103,19 @@
         })
       );
 
-      machine.addEventListener("restart", () => {
+      machine.on("halt", () => {
+        term.write("halting...");
+      });
+
+      machine.on("restart", () => {
         location.reload();
       });
 
-      machine.addEventListener("error", ({ detail: { error, threadName } }) => {
+      machine.on("error", ({ error, threadName }) => {
         term.write(`${error.name} in ${threadName}: ${error.message}\n`);
       });
+
+      machine.boot();
     </script>
   </body>
 </html>
