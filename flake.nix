@@ -20,7 +20,7 @@
               llvm = pkgs.llvmPackages_17;
             in
             {
-              default = llvm.stdenv.mkDerivation {
+              default = pkgs.stdenvNoCC.mkDerivation {
                 pname = "linux";
                 version = "6.1.69-wasm";
                 src = ./.;
@@ -49,6 +49,7 @@
                   ncurses
 
                   dtc
+                  llvm.clang-unwrapped
                   llvm.lld
                   llvm.libllvm
                   wabt
@@ -56,9 +57,11 @@
                   typescript
                 ];
 
+                HOSTCC = "${llvm.clang}/bin/clang";
+
                 enableParallelBuilding = true;
-                configurePhase = "make -j$NIX_BUILD_CORES defconfig";
-                buildPhase = "make -j$NIX_BUILD_CORES tools/wasm";
+                configurePhase = "make HOSTCC=$HOSTCC -j$NIX_BUILD_CORES defconfig";
+                buildPhase = "make HOSTCC=$HOSTCC -j$NIX_BUILD_CORES -C tools/wasm";
                 installPhase = ''
                   mkdir $out
                   rm tools/wasm/public/dist
